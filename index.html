@@ -1,0 +1,297 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <meta name="theme-color" content="#f5f7f8" />
+  <meta name="robots" content="noindex,nofollow,noarchive" />
+  <title>자산관리</title>
+  <style>
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      background: #f5f7f8;
+      color: #14222d;
+      font-family: system-ui, -apple-system, "Noto Sans KR", sans-serif;
+      overflow: hidden;
+    }
+    #appFrame {
+      position: fixed;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      border: 0;
+      background: #f5f7f8;
+      z-index: 1;
+    }
+    #bootOverlay {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+      padding: 24px;
+      background: #f5f7f8;
+      z-index: 10;
+      transition: opacity 0.15s ease;
+    }
+    #bootOverlay.hidden {
+      opacity: 0;
+      pointer-events: none;
+    }
+    .boot-mark {
+      width: 44px;
+      height: 44px;
+      border-radius: 14px;
+      background: #178b72;
+      color: #fff;
+      display: grid;
+      place-items: center;
+      font-weight: 800;
+      font-size: 22px;
+      box-shadow: 0 6px 16px rgba(23, 139, 114, 0.25);
+    }
+    .boot-title {
+      font-size: 19px;
+      font-weight: 800;
+      color: #14222d;
+    }
+    .boot-sub {
+      font-size: 13px;
+      color: #7a8792;
+      text-align: center;
+      line-height: 1.6;
+    }
+  </style>
+</head>
+<body>
+  <div id="bootOverlay">
+    <div class="boot-mark">₩</div>
+    <div class="boot-title">자산관리</div>
+    <div class="boot-sub" id="bootStatus">클라우드에서 자산 데이터를 초고속으로 불러오는 중…</div>
+  </div>
+
+  <iframe id="appFrame" title="자산관리"></iframe>
+
+  <script>
+    (() => {
+      const FIREBASE_DB_URL = 'https://recoverist-hub-default-rtdb.asia-southeast1.firebasedatabase.app/';
+      const GAS_URL = 'https://script.google.com/macros/s/AKfycbwCBzKd6Vb2kFonZFsUsIErhU4HbX3UDB55yjrHDb-n0iJ0Nv15q6WpHkOAosyQohrp/exec';
+      const CHANNEL = 'asset-manager-sheet-bridge-v1';
+
+      const appFrame = document.getElementById('appFrame');
+      const bootOverlay = document.getElementById('bootOverlay');
+      const bootStatus = document.getElementById('bootStatus');
+
+      const cleanFbUrl = String(FIREBASE_DB_URL || '').trim().replace(/\/+$/, '');
+
+      let bridgeSource = null;
+      let resolveBridgeReady = null;
+      const pending = new Map();
+
+      const bridgeReady = new Promise((resolve) => {
+        resolveBridgeReady = resolve;
+      });
+
+      window.addEventListener('message', (event) => {
+        let host = '';
+        try { host = new URL(event.origin).hostname; } catch (_) { return; }
+        const fromAppsScript = host === 'script.google.com' || (host.includes('script') && host.endsWith('googleusercontent.com'));
+        if (!fromAppsScript || !event.data || event.data.channel !== CHANNEL) return;
+
+        if (event.data.type === 'ready') {
+          if (!bridgeSource) {
+            bridgeSource = event.source;
+            resolveBridgeReady();
+          }
+          return;
+        }
+        if (event.source !== bridgeSource) return;
+        const item = pending.get(event.data.id);
+        if (!item) return;
+        clearTimeout(item.timer);
+        pending.delete(event.data.id);
+        event.data.error ? item.reject(new Error(event.data.error)) : item.resolve(event.data.result);
+      });
+
+      const bridgeFrame = document.createElement('iframe');
+      bridgeFrame.title = '자산관리 시트 연결';
+      bridgeFrame.setAttribute('aria-hidden', 'true');
+      bridgeFrame.tabIndex = -1;
+      bridgeFrame.style.cssText = 'position:fixed;left:-9999px;width:1px;height:1px;border:0;opacity:0';
+      bridgeFrame.src = GAS_URL;
+      document.body.appendChild(bridgeFrame);
+
+      async function readCloud(key) {
+        try {
+          const res = await fetch(`${cleanFbUrl}/asset/${key}.json`, { cache: 'no-store' });
+          if (!res.ok) return null;
+          return await res.json();
+        } catch (_) {
+          return null;
+        }
+      }
+
+      async function writeCloud(key, data) {
+        if (!data) return;
+        try {
+          await fetch(`${cleanFbUrl}/asset/${key}.json`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(data)
+          });
+        } catch (_) {}
+      }
+
+      window.__assetSheetCall = async (action, payload) => {
+        let waitTimer;
+        await Promise.race([
+          bridgeReady,
+          new Promise((_, reject) => {
+            waitTimer = setTimeout(() => reject(new Error('시트 연결이 지연되고 있어.')), 15000);
+          })
+        ]).finally(() => clearTimeout(waitTimer));
+
+        return new Promise((resolve, reject) => {
+          const id = 'sync-' + Date.now() + '-' + Math.random().toString(36).slice(2);
+          const timer = setTimeout(() => {
+            pending.delete(id);
+            reject(new Error('시트 응답 시간이 초과됐어.'));
+          }, 25000);
+          pending.set(id, { resolve, reject, timer });
+          bridgeSource.postMessage({ channel: CHANNEL, id, action, payload }, '*');
+        });
+      };
+
+      // 클라우드 우선 읽기 + 구글 시트 원본 동기화
+      window.__assetHybridCall = async (action, payload) => {
+        if (action === 'read') {
+          const cloudState = await readCloud('state');
+          if (cloudState && cloudState.ok) {
+            // 백그라운드에서 구글 시트 최신본 확인 및 클라우드 갱신
+            window.__assetSheetCall('read').then((fresh) => {
+              if (fresh && fresh.ok && fresh.state) {
+                writeCloud('state', fresh);
+              }
+            }).catch(() => {});
+            return cloudState;
+          }
+          const sheetState = await window.__assetSheetCall('read');
+          if (sheetState && sheetState.ok && sheetState.state) {
+            writeCloud('state', sheetState);
+          }
+          return sheetState;
+        }
+
+        if (action === 'write') {
+          const res = await window.__assetSheetCall('write', payload);
+          if (res && res.ok) {
+            const persisted = JSON.parse(JSON.stringify(payload || {}));
+            delete persisted.resetQuarters;
+            delete persisted.resetBaselines;
+            delete persisted.pendingBriefings;
+            writeCloud('state', {
+              ok: true,
+              updatedAt: res.updatedAt || Date.now(),
+              state: { ...persisted, briefings: res.briefings || [] },
+              briefings: res.briefings || []
+            });
+          }
+          return res;
+        }
+
+        return window.__assetSheetCall(action, payload);
+      };
+
+      window.__loadBootstrapFromCloud = async () => {
+        return await readCloud('bootstrap');
+      };
+
+      function injectIntoAssetApp(rawHtml) {
+        const closeTag = '<' + '/script>';
+        const shim =
+          '<script>\n' +
+          '(() => {\n' +
+          '  const origFetch = window.fetch.bind(window);\n' +
+          '  window.fetch = async (input, init) => {\n' +
+          '    const url = typeof input === "string" ? input : (input && input.url ? input.url : "");\n' +
+          '    if (url.includes("private-data.json")) {\n' +
+          '      const data = await window.parent.__loadBootstrapFromCloud();\n' +
+          '      if (data && data.data) {\n' +
+          '        return new Response(JSON.stringify(data), { status: 200, headers: { "Content-Type": "application/json" } });\n' +
+          '      }\n' +
+          '      try {\n' +
+          '        const localRes = await origFetch("./private-data.json", { cache: "no-store" });\n' +
+          '        if (localRes.ok) return localRes;\n' +
+          '      } catch (_) {}\n' +
+          '    }\n' +
+          '    return origFetch(input, init);\n' +
+          '  };\n' +
+          '})();\n' +
+          closeTag;
+
+        const swRe = new RegExp('<script>\\(\\(\\)=>\\{if\\(!\\(\'serviceWorker\'[\\s\\S]*?<' + '/script>', 'gi');
+        const cfRe = new RegExp('<script>\\(function\\(\\)\\{function c\\(\\)[\\s\\S]*?<' + '/script>', 'gi');
+
+        // 내부 iframe에서 부모의 하이브리드 브리지(__assetHybridCall)를 바로 쓰도록 연결
+        const bridgeReplace =
+          'async function initializeSheetBridge(){\n' +
+          '  if(bridgeInitialized)return;\n' +
+          '  bridgeInitialized=true;\n' +
+          '  bridgeReady=true;\n' +
+          '  setSyncLabel("클라우드 확인 중…","pending");\n' +
+          '  try {\n' +
+          '    const remote = await window.parent.__assetHybridCall("read");\n' +
+          '    if(remote && remote.ok && remote.state){\n' +
+          '      applySyncedState(remote.state, remote.updatedAt || Date.now());\n' +
+          '      briefingRows = mergeBriefingRows(briefingRows, window.BRIEFING_FALLBACK, remote.briefings);\n' +
+          '      refresh();\n' +
+          '    }\n' +
+          '    setSyncLabel("클라우드 · 시트 연결됨","ready");\n' +
+          '  } catch (err) {\n' +
+          '    setSyncLabel("저장된 자료 표시 중","pending");\n' +
+          '  }\n' +
+          '}\n' +
+          'const _origBridgeCall = bridgeCall;\n';
+
+        let cleaned = String(rawHtml || '')
+          .replace(swRe, '')
+          .replace(cfRe, '')
+          .replace('function bridgeCall(action,payload){', 'function bridgeCall(action,payload){ return window.parent.__assetHybridCall(action,payload); ')
+          .replace('async function initializeSheetBridge(){', bridgeReplace + 'async function _unusedInitBridge(){');
+
+        if (/<head[^>]*>/i.test(cleaned)) {
+          return cleaned.replace(/<head[^>]*>/i, (m) => m + shim);
+        }
+        return shim + cleaned;
+      }
+
+      async function loadAppShell() {
+        const candidates = ['./app.html', './자산관리%20site%20html%20소스.txt'];
+        for (const path of candidates) {
+          try {
+            const res = await fetch(path);
+            if (res.ok) {
+              const text = await res.text();
+              if (text.includes('asset-generic-shell-v1') || text.includes('자산관리')) {
+                appFrame.onload = () => bootOverlay.classList.add('hidden');
+                appFrame.srcdoc = injectIntoAssetApp(text);
+                setTimeout(() => bootOverlay.classList.add('hidden'), 200);
+                return;
+              }
+            }
+          } catch (_) {}
+        }
+        bootStatus.innerHTML = '깃허브 저장소에 <b>app.html</b> 파일을 함께 올려주세요.<br>(<b>자산관리 site html 소스.txt</b> 파일 이름을 <b>app.html</b>로 변경해 업로드)';
+      }
+
+      loadAppShell();
+    })();
+  </script>
+</body>
+</html>
