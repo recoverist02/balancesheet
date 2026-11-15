@@ -80,7 +80,6 @@
 
   <script>
     (() => {
-      // 비밀번호 잠금을 사용하려면 따옴표 안에 숫자를 넣으세요 (예: '1234', 비워두면 바로 열림)
       const APP_PIN = '';
 
       const FIREBASE_DB_URL = 'https://recoverist-hub-default-rtdb.asia-southeast1.firebasedatabase.app/';
@@ -136,7 +135,6 @@
         event.data.error ? item.reject(new Error(event.data.error)) : item.resolve(event.data.result);
       });
 
-      // 백그라운드 구글 시트 백업용 숨김 브리지
       const bridgeFrame = document.createElement('iframe');
       bridgeFrame.title = '자산관리 시트 백업 연결';
       bridgeFrame.setAttribute('aria-hidden', 'true');
@@ -189,14 +187,31 @@
         });
       };
 
-      // 핵심: 모든 읽기·쓰기는 Firebase 클라우드에서 즉시 처리하고, 구글 시트는 백그라운드 백업만 수행
+      // 미백업된 데이터가 남아 있으면 시트 연결 시 백그라운드로 자동 백업 재시도
+      function flushPendingBackupToSheet(cloudState) {
+        if (!cloudState || !cloudState.needsSheetBackup || !cloudState.unsyncedPayload) return;
+        const payloadToSync = cloudState.unsyncedPayload;
+        window.__assetSheetCall('write', payloadToSync).then((sheetRes) => {
+          const cleaned = JSON.parse(JSON.stringify(cloudState));
+          cleaned.needsSheetBackup = false;
+          cleaned.unsyncedPayload = null;
+          if (sheetRes && Array.isArray(sheetRes.briefings) && sheetRes.briefings.length) {
+            cleaned.briefings = sheetRes.briefings;
+            if (cleaned.state) cleaned.state.briefings = sheetRes.briefings;
+          }
+          writeCloud('state', cleaned);
+        }).catch(() => {});
+      }
+
       window.__assetHybridCall = async (action, payload) => {
         if (action === 'read') {
           const cloudState = await readCloud('state');
           if (cloudState && cloudState.ok) {
+            if (cloudState.needsSheetBackup) {
+              flushPendingBackupToSheet(cloudState);
+            }
             return cloudState;
           }
-          // 클라우드가 비어 있는 최초 1회에만 시트에서 읽어와 클라우드에 저장
           const sheetState = await window.__assetSheetCall('read');
           if (sheetState && sheetState.ok && sheetState.state) {
             await writeCloud('state', sheetState);
@@ -211,6 +226,7 @@
             ? prevCloud.briefings
             : (prevCloud.state && Array.isArray(prevCloud.state.briefings) ? prevCloud.state.briefings : []);
 
+          const rawPayloadCopy = JSON.parse(JSON.stringify(payload || {}));
           const persisted = JSON.parse(JSON.stringify(payload || {}));
           const pendingBriefings = Array.isArray(persisted.pendingBriefings) ? persisted.pendingBriefings : [];
           delete persisted.resetQuarters;
@@ -221,44 +237,41 @@
           const newCloudRecord = {
             ok: true,
             updatedAt: now,
+            needsSheetBackup: true,
+            unsyncedPayload: rawPayloadCopy,
             state: { ...persisted, briefings: mergedBriefings },
             briefings: mergedBriefings
           };
 
-          // 1) Firebase 클라우드에 0.1초 만에 즉시 메인 저장
+          // 1) Firebase 클라우드에 0.1초 만에 즉시 메인 저장 (미백업 보호 플래그 포함)
           const saved = await writeCloud('state', newCloudRecord);
           if (!saved) {
             throw new Error('Firebase 클라우드 저장에 실패했어. 네트워크를 확인해줘.');
           }
 
-          // 2) 구글 시트(자산관리_초안)에는 백그라운드로 조용히 백업
-          window.__assetSheetCall('write', payload).then((sheetRes) => {
-            if (sheetRes && Array.isArray(sheetRes.briefings) && sheetRes.briefings.length) {
-              writeCloud('state', {
-                ok: true,
-                updatedAt: sheetRes.updatedAt || now,
-                state: { ...persisted, briefings: sheetRes.briefings },
-                briefings: sheetRes.briefings
-              });
-            }
-            window.__assetSheetCall('bootstrap').then((boot) => {
-              if (boot && boot.data && boot.data.periodRows) {
-                writeCloud('bootstrap', boot);
-                try { localStorage.setItem(BOOT_CACHE_KEY, JSON.stringify({ version: APP_BOOT_VERSION, payload: boot })); } catch (_) {}
-              }
-            }).catch(() => {});
+          // 2) 구글 시트에 백그라운드 백업 수행 후 성공 시 미백업 플래그 해제
+          window.__assetSheetCall('write', rawPayloadCopy).then((sheetRes) => {
+            const finalBriefings = (sheetRes && Array.isArray(sheetRes.briefings) && sheetRes.briefings.length)
+              ? sheetRes.briefings
+              : mergedBriefings;
+            writeCloud('state', {
+              ok: true,
+              updatedAt: (sheetRes && sheetRes.updatedAt) ? sheetRes.updatedAt : now,
+              needsSheetBackup: false,
+              unsyncedPayload: null,
+              state: { ...persisted, briefings: finalBriefings },
+              briefings: finalBriefings
+            });
           }).catch((err) => {
-            console.warn('구글 시트 백그라운드 백업 건너뜀:', err);
+            console.warn('구글 시트 백그라운드 백업 대기 중 (다음 연결 시 자동 반영):', err);
           });
 
           return newCloudRecord;
         }
 
-        // 텔레그램 브리핑 전송 등 특수 작업은 앱스크립트 호출
         return window.__assetSheetCall(action, payload);
       };
 
-      // 항상 Firebase 클라우드의 최신 기본 데이터를 1순위로 불러와 캐시 역전 방지
       window.__getAssetBootstrap = async () => {
         const cloudBoot = await readCloud('bootstrap');
         if (cloudBoot && cloudBoot.data && cloudBoot.data.periodRows) {
@@ -319,8 +332,10 @@
           '      applySyncedState(remote.state, remote.updatedAt || Date.now());\n' +
           '      briefingRows = mergeBriefingRows(briefingRows, window.BRIEFING_FALLBACK, remote.briefings);\n' +
           '      refresh();\n' +
+          '      setSyncLabel("Firebase 클라우드 연결됨 (시트 자동백업)","ready");\n' +
+          '    } else {\n' +
+          '      setSyncLabel("기본 자료 표시 중","pending");\n' +
           '    }\n' +
-          '    setSyncLabel("Firebase 클라우드 연결됨 (시트 자동백업)","ready");\n' +
           '  } catch (err) {\n' +
           '    setSyncLabel("저장된 자료 표시 중","pending");\n' +
           '  }\n' +
