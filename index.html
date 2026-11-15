@@ -73,16 +73,17 @@
   <div id="bootOverlay">
     <div class="boot-mark">₩</div>
     <div class="boot-title">자산관리</div>
-    <div class="boot-sub" id="bootStatus">Firebase 클라우드에서 자산 데이터를 불러오는 중…</div>
+    <div class="boot-sub" id="bootStatus">클라우드에서 자산 데이터를 초고속으로 불러오는 중…</div>
   </div>
 
   <iframe id="appFrame" title="자산관리"></iframe>
 
   <script>
     (() => {
+      // 비밀번호 잠금을 사용하려면 따옴표 안에 원하는 비밀번호를 넣으세요 (예: '1234', 비워두면 바로 열림)
       const APP_PIN = '';
 
-      const FIREBASE_DB_URL = 'https://recoverist-hub-default-rtdb.asia-southeast1.firebasedatabase.app/';
+      const FIREBASE_DB_URL = 'https://recoverist-hub-default-rtdb.asia-southeast1.firebasedatabase.app';
       const GAS_URL = 'https://script.google.com/macros/s/AKfycbwCBzKd6Vb2kFonZFsUsIErhU4HbX3UDB55yjrHDb-n0iJ0Nv15q6WpHkOAosyQohrp/exec';
       const CHANNEL = 'asset-manager-sheet-bridge-v1';
       const BOOT_CACHE_KEY = 'asset-bootstrap-v1';
@@ -91,7 +92,6 @@
       const appFrame = document.getElementById('appFrame');
       const bootOverlay = document.getElementById('bootOverlay');
       const bootStatus = document.getElementById('bootStatus');
-
       const cleanFbUrl = String(FIREBASE_DB_URL || '').trim().replace(/\/+$/, '');
 
       if (APP_PIN) {
@@ -106,13 +106,110 @@
         }
       }
 
+      // Firebase가 객체({"0":...})로 변환한 데이터를 정상 배열로 복원
+      function toArray(val) {
+        if (!val) return [];
+        if (Array.isArray(val)) return val;
+        if (typeof val === 'object') {
+          const keys = Object.keys(val).map(Number).filter(Number.isFinite);
+          if (!keys.length) return [];
+          const len = Math.max(...keys) + 1;
+          return Array.from({ length: len }, (_, i) => (val[i] === undefined ? '' : val[i]));
+        }
+        return [];
+      }
+
+      function to2DArray(table, minWidth = 0) {
+        const rows = toArray(table).filter(r => r != null);
+        return rows.map(r => {
+          const arr = toArray(r);
+          const width = Math.max(minWidth, arr.length);
+          return Array.from({ length: width }, (_, i) => (arr[i] == null ? '' : String(arr[i])));
+        });
+      }
+
+      function normalizeBootstrap(raw) {
+        if (!raw || typeof raw !== 'object' || !raw.data) return null;
+        return {
+          ...raw,
+          ok: true,
+          data: {
+            source: raw.data.source || '자산관리_초안',
+            importedThrough: raw.data.importedThrough || '2026Q3',
+            periodRows: to2DArray(raw.data.periodRows, 14),
+            balanceRows: to2DArray(raw.data.balanceRows, 10),
+            targetRows: to2DArray(raw.data.targetRows, 13)
+          },
+          briefings: toArray(raw.briefings).filter(Boolean)
+        };
+      }
+
+      function normalizeStateRecord(raw) {
+        if (!raw || typeof raw !== 'object') return null;
+        const st = (raw.state && typeof raw.state === 'object') ? raw.state : {};
+        const briefings = toArray(raw.briefings || st.briefings).filter(Boolean);
+        return {
+          ...raw,
+          ok: true,
+          updatedAt: Number(raw.updatedAt) || Date.now(),
+          state: {
+            ...st,
+            actualsByYear: (st.actualsByYear && typeof st.actualsByYear === 'object') ? st.actualsByYear : {},
+            deletedGoalYears: toArray(st.deletedGoalYears).filter(Boolean),
+            periods: (st.periods && typeof st.periods === 'object') ? st.periods : {},
+            goalsByYear: (st.goalsByYear && typeof st.goalsByYear === 'object') ? st.goalsByYear : {},
+            records: (st.records && typeof st.records === 'object') ? st.records : {},
+            briefings
+          },
+          briefings
+        };
+      }
+
+      function dedupeBriefings(list) {
+        const seen = new Set();
+        const out = [];
+        for (const item of toArray(list)) {
+          if (!item || typeof item !== 'object') continue;
+          const key = String(item.id || `${item.quarter || ''}|${item.createdAt || item.date || ''}|${item.title || ''}`);
+          if (seen.has(key)) continue;
+          seen.add(key);
+          out.push(item);
+        }
+        return out;
+      }
+
+      // 1. 페이지 시작 즉시 app.html, bootstrap.json, state.json 3가지를 동시에 병렬 프리패치!
+      let cachedBoot = null;
+      let cachedState = null;
+      let latestWriteSeq = 0;
+
+      const prefetchShellPromise = fetch('./app.html')
+        .then(r => (r.ok ? r.text() : null))
+        .catch(() => null);
+
+      const prefetchBootPromise = fetch(`${cleanFbUrl}/asset/bootstrap.json`, { cache: 'no-store' })
+        .then(r => (r.ok ? r.json() : null))
+        .then(d => {
+          const norm = normalizeBootstrap(d);
+          if (norm && norm.data.periodRows.length) cachedBoot = norm;
+          return cachedBoot;
+        })
+        .catch(() => null);
+
+      const prefetchStatePromise = fetch(`${cleanFbUrl}/asset/state.json`, { cache: 'no-store' })
+        .then(r => (r.ok ? r.json() : null))
+        .then(d => {
+          const norm = normalizeStateRecord(d);
+          if (norm) cachedState = norm;
+          return cachedState;
+        })
+        .catch(() => null);
+
+      // 2. 구글 시트 백그라운드 백업용 숨김 브리지
       let bridgeSource = null;
       let resolveBridgeReady = null;
       const pending = new Map();
-
-      const bridgeReady = new Promise((resolve) => {
-        resolveBridgeReady = resolve;
-      });
+      const bridgeReady = new Promise(resolve => { resolveBridgeReady = resolve; });
 
       window.addEventListener('message', (event) => {
         let host = '';
@@ -140,18 +237,8 @@
       bridgeFrame.setAttribute('aria-hidden', 'true');
       bridgeFrame.tabIndex = -1;
       bridgeFrame.style.cssText = 'position:fixed;left:-9999px;width:1px;height:1px;border:0;opacity:0';
-      bridgeFrame.src = GAS_URL;
+      bridgeFrame.src = GAS_URL + '?bridge=1';
       document.body.appendChild(bridgeFrame);
-
-      async function readCloud(key) {
-        try {
-          const res = await fetch(`${cleanFbUrl}/asset/${key}.json`, { cache: 'no-store' });
-          if (!res.ok) return null;
-          return await res.json();
-        } catch (_) {
-          return null;
-        }
-      }
 
       async function writeCloud(key, data) {
         if (!data) return false;
@@ -187,108 +274,134 @@
         });
       };
 
-      // 미백업된 데이터가 남아 있으면 시트 연결 시 백그라운드로 자동 백업 재시도
+      // 미백업 데이터가 남아있을 때 시트 연결 즉시 백그라운드 자동 백업
       function flushPendingBackupToSheet(cloudState) {
         if (!cloudState || !cloudState.needsSheetBackup || !cloudState.unsyncedPayload) return;
-        const payloadToSync = cloudState.unsyncedPayload;
-        window.__assetSheetCall('write', payloadToSync).then((sheetRes) => {
-          const cleaned = JSON.parse(JSON.stringify(cloudState));
-          cleaned.needsSheetBackup = false;
-          cleaned.unsyncedPayload = null;
-          if (sheetRes && Array.isArray(sheetRes.briefings) && sheetRes.briefings.length) {
-            cleaned.briefings = sheetRes.briefings;
-            if (cleaned.state) cleaned.state.briefings = sheetRes.briefings;
-          }
-          writeCloud('state', cleaned);
-        }).catch(() => {});
+        const mySeq = latestWriteSeq;
+        window.__assetSheetCall('write', cloudState.unsyncedPayload)
+          .then(sheetRes => {
+            if (mySeq !== latestWriteSeq) return;
+            const cleaned = normalizeStateRecord({
+              ...cloudState,
+              needsSheetBackup: false,
+              unsyncedPayload: null,
+              briefings: (sheetRes && Array.isArray(sheetRes.briefings) && sheetRes.briefings.length)
+                ? dedupeBriefings([...sheetRes.briefings, ...(cloudState.briefings || [])])
+                : cloudState.briefings
+            });
+            cachedState = cleaned;
+            writeCloud('state', cleaned);
+          })
+          .catch(() => {});
       }
 
+      // 3. 클라우드 메인 처리 + 구글 시트 백그라운드 백업 라우터
       window.__assetHybridCall = async (action, payload) => {
         if (action === 'read') {
-          const cloudState = await readCloud('state');
+          const cloudState = cachedState || (await prefetchStatePromise);
           if (cloudState && cloudState.ok) {
             if (cloudState.needsSheetBackup) {
               flushPendingBackupToSheet(cloudState);
             }
             return cloudState;
           }
-          const sheetState = await window.__assetSheetCall('read');
-          if (sheetState && sheetState.ok && sheetState.state) {
+          const sheetState = normalizeStateRecord(await window.__assetSheetCall('read'));
+          if (sheetState && sheetState.ok) {
+            cachedState = sheetState;
             await writeCloud('state', sheetState);
           }
           return sheetState;
         }
 
         if (action === 'write') {
+          const mySeq = ++latestWriteSeq;
           const now = Date.now();
-          const prevCloud = (await readCloud('state')) || {};
-          const prevBriefings = Array.isArray(prevCloud.briefings)
-            ? prevCloud.briefings
-            : (prevCloud.state && Array.isArray(prevCloud.state.briefings) ? prevCloud.state.briefings : []);
+          const prevCloud = cachedState || (await prefetchStatePromise) || {};
+          const prevBriefings = toArray(prevCloud.briefings || prevCloud.state?.briefings);
 
           const rawPayloadCopy = JSON.parse(JSON.stringify(payload || {}));
           const persisted = JSON.parse(JSON.stringify(payload || {}));
-          const pendingBriefings = Array.isArray(persisted.pendingBriefings) ? persisted.pendingBriefings : [];
+          const pendingBriefings = toArray(persisted.pendingBriefings);
           delete persisted.resetQuarters;
           delete persisted.resetBaselines;
           delete persisted.pendingBriefings;
 
-          const mergedBriefings = [...pendingBriefings, ...prevBriefings];
-          const newCloudRecord = {
+          const mergedBriefings = dedupeBriefings([...pendingBriefings, ...prevBriefings]);
+          const newCloudRecord = normalizeStateRecord({
             ok: true,
             updatedAt: now,
             needsSheetBackup: true,
             unsyncedPayload: rawPayloadCopy,
             state: { ...persisted, briefings: mergedBriefings },
             briefings: mergedBriefings
-          };
+          });
 
-          // 1) Firebase 클라우드에 0.1초 만에 즉시 메인 저장 (미백업 보호 플래그 포함)
+          // 1) Firebase 클라우드에 0.1초 만에 즉시 저장 완료 처리
+          cachedState = newCloudRecord;
           const saved = await writeCloud('state', newCloudRecord);
           if (!saved) {
             throw new Error('Firebase 클라우드 저장에 실패했어. 네트워크를 확인해줘.');
           }
 
-          // 2) 구글 시트에 백그라운드 백업 수행 후 성공 시 미백업 플래그 해제
-          window.__assetSheetCall('write', rawPayloadCopy).then((sheetRes) => {
-            const finalBriefings = (sheetRes && Array.isArray(sheetRes.briefings) && sheetRes.briefings.length)
-              ? sheetRes.briefings
-              : mergedBriefings;
-            writeCloud('state', {
-              ok: true,
-              updatedAt: (sheetRes && sheetRes.updatedAt) ? sheetRes.updatedAt : now,
-              needsSheetBackup: false,
-              unsyncedPayload: null,
-              state: { ...persisted, briefings: finalBriefings },
-              briefings: finalBriefings
+          // 2) 구글 시트에는 백그라운드로 조용히 백업 + 시트 수식 재계산 결과(bootstrap)도 클라우드에 반영
+          window.__assetSheetCall('write', rawPayloadCopy)
+            .then(sheetRes => {
+              if (mySeq !== latestWriteSeq) return;
+              const syncedBriefings = (sheetRes && Array.isArray(sheetRes.briefings) && sheetRes.briefings.length)
+                ? dedupeBriefings([...sheetRes.briefings, ...mergedBriefings])
+                : mergedBriefings;
+              const finalized = normalizeStateRecord({
+                ok: true,
+                updatedAt: Date.now(),
+                needsSheetBackup: false,
+                unsyncedPayload: null,
+                state: { ...persisted, briefings: syncedBriefings },
+                briefings: syncedBriefings
+              });
+              cachedState = finalized;
+              writeCloud('state', finalized);
+
+              window.__assetSheetCall('bootstrap')
+                .then(boot => {
+                  const normBoot = normalizeBootstrap(boot);
+                  if (normBoot && normBoot.data.periodRows.length) {
+                    cachedBoot = normBoot;
+                    writeCloud('bootstrap', normBoot);
+                    try { localStorage.setItem(BOOT_CACHE_KEY, JSON.stringify({ version: APP_BOOT_VERSION, payload: normBoot })); } catch (_) {}
+                  }
+                })
+                .catch(() => {});
+            })
+            .catch(err => {
+              console.warn('구글 시트 백그라운드 백업 대기 중:', err);
             });
-          }).catch((err) => {
-            console.warn('구글 시트 백그라운드 백업 대기 중 (다음 연결 시 자동 반영):', err);
-          });
 
           return newCloudRecord;
         }
 
+        // 텔레그램 브리핑 전송 등 특수 작업은 앱스크립트로 실행
         return window.__assetSheetCall(action, payload);
       };
 
       window.__getAssetBootstrap = async () => {
-        const cloudBoot = await readCloud('bootstrap');
-        if (cloudBoot && cloudBoot.data && cloudBoot.data.periodRows) {
+        const cloudBoot = cachedBoot || (await prefetchBootPromise);
+        if (cloudBoot && cloudBoot.data && cloudBoot.data.periodRows.length) {
           try { localStorage.setItem(BOOT_CACHE_KEY, JSON.stringify({ version: APP_BOOT_VERSION, payload: cloudBoot })); } catch (_) {}
           return cloudBoot;
         }
 
         try {
           const cached = JSON.parse(localStorage.getItem(BOOT_CACHE_KEY) || 'null');
-          if (cached && cached.payload && cached.payload.data && cached.payload.data.periodRows) {
-            return cached.payload;
+          const normCached = normalizeBootstrap(cached?.payload);
+          if (normCached && normCached.data.periodRows.length) {
+            return normCached;
           }
         } catch (_) {}
 
         bootStatus.textContent = '최초 1회: 구글 시트에서 기본 자산 데이터를 가져와 클라우드에 세팅 중…';
-        const sheetBoot = await window.__assetSheetCall('bootstrap');
-        if (sheetBoot && sheetBoot.data && sheetBoot.data.periodRows) {
+        const sheetBoot = normalizeBootstrap(await window.__assetSheetCall('bootstrap'));
+        if (sheetBoot && sheetBoot.data.periodRows.length) {
+          cachedBoot = sheetBoot;
           await writeCloud('bootstrap', sheetBoot);
           try { localStorage.setItem(BOOT_CACHE_KEY, JSON.stringify({ version: APP_BOOT_VERSION, payload: sheetBoot })); } catch (_) {}
           return sheetBoot;
@@ -329,10 +442,10 @@
           '  try {\n' +
           '    const remote = await window.parent.__assetHybridCall("read");\n' +
           '    if(remote && remote.ok && remote.state){\n' +
-          '      applySyncedState(remote.state, remote.updatedAt || Date.now());\n' +
+          '      applySyncedState(remote.state, Math.max(Number(remote.updatedAt) || 0, Date.now() + 1000));\n' +
           '      briefingRows = mergeBriefingRows(briefingRows, window.BRIEFING_FALLBACK, remote.briefings);\n' +
           '      refresh();\n' +
-          '      setSyncLabel("Firebase 클라우드 연결됨 (시트 자동백업)","ready");\n' +
+          '      setSyncLabel("클라우드 연결됨 · 시트 자동 백업","ready");\n' +
           '    } else {\n' +
           '      setSyncLabel("기본 자료 표시 중","pending");\n' +
           '    }\n' +
@@ -353,38 +466,32 @@
         return shim + cleaned;
       }
 
-      async function loadAppShell() {
-        const candidates = ['./app.html', './자산관리%20site%20html%20소스.txt'];
-        let appHtmlText = '';
-        for (const path of candidates) {
+      async function boot() {
+        let appHtmlText = await prefetchShellPromise;
+        if (!appHtmlText) {
           try {
-            const res = await fetch(path);
-            if (res.ok) {
-              const text = await res.text();
-              if (text.includes('asset-generic-shell-v1') || text.includes('자산관리')) {
-                appHtmlText = text;
-                break;
-              }
-            }
+            const res = await fetch('./자산관리%20site%20html%20소스.txt');
+            if (res.ok) appHtmlText = await res.text();
           } catch (_) {}
         }
 
-        if (!appHtmlText) {
-          bootStatus.innerHTML = '깃허브 저장소에 <b>app.html</b> 파일을 함께 올려주세요.';
+        if (!appHtmlText || (!appHtmlText.includes('asset-generic-shell-v1') && !appHtmlText.includes('자산관리'))) {
+          bootStatus.innerHTML = '깃허브 저장소에 <b>app.html</b> 파일을 확인해 주세요.';
           return;
         }
 
         try {
           const bootstrapPayload = await window.__getAssetBootstrap();
+          await prefetchStatePromise;
           appFrame.onload = () => bootOverlay.classList.add('hidden');
           appFrame.srcdoc = injectIntoAssetApp(appHtmlText, bootstrapPayload);
-          setTimeout(() => bootOverlay.classList.add('hidden'), 200);
+          setTimeout(() => bootOverlay.classList.add('hidden'), 150);
         } catch (err) {
           bootStatus.innerHTML = '기본 자산 데이터를 불러오지 못했습니다.<br>' + (err && err.message ? err.message : String(err));
         }
       }
 
-      loadAppShell();
+      boot();
     })();
   </script>
 </body>
