@@ -73,22 +73,39 @@
   <div id="bootOverlay">
     <div class="boot-mark">₩</div>
     <div class="boot-title">자산관리</div>
-    <div class="boot-sub" id="bootStatus">클라우드에서 자산 데이터를 초고속으로 불러오는 중…</div>
+    <div class="boot-sub" id="bootStatus">Firebase 클라우드에서 자산 데이터를 불러오는 중…</div>
   </div>
 
   <iframe id="appFrame" title="자산관리"></iframe>
 
   <script>
     (() => {
+      // 비밀번호 잠금을 사용하려면 따옴표 안에 숫자를 넣으세요 (예: '1234', 비워두면 바로 열림)
+      const APP_PIN = '';
+
       const FIREBASE_DB_URL = 'https://recoverist-hub-default-rtdb.asia-southeast1.firebasedatabase.app/';
       const GAS_URL = 'https://script.google.com/macros/s/AKfycbwCBzKd6Vb2kFonZFsUsIErhU4HbX3UDB55yjrHDb-n0iJ0Nv15q6WpHkOAosyQohrp/exec';
       const CHANNEL = 'asset-manager-sheet-bridge-v1';
+      const BOOT_CACHE_KEY = 'asset-bootstrap-v1';
+      const APP_BOOT_VERSION = 'e974758bf3ee36c1433d';
 
       const appFrame = document.getElementById('appFrame');
       const bootOverlay = document.getElementById('bootOverlay');
       const bootStatus = document.getElementById('bootStatus');
 
       const cleanFbUrl = String(FIREBASE_DB_URL || '').trim().replace(/\/+$/, '');
+
+      if (APP_PIN) {
+        const savedPin = sessionStorage.getItem('asset_pin_ok');
+        if (savedPin !== APP_PIN) {
+          const input = prompt('자산관리 비밀번호(PIN)를 입력하세요:');
+          if (input !== APP_PIN) {
+            bootStatus.innerHTML = '비밀번호가 일치하지 않습니다.<br>새로고침하여 다시 입력해 주세요.';
+            return;
+          }
+          sessionStorage.setItem('asset_pin_ok', APP_PIN);
+        }
+      }
 
       let bridgeSource = null;
       let resolveBridgeReady = null;
@@ -119,8 +136,9 @@
         event.data.error ? item.reject(new Error(event.data.error)) : item.resolve(event.data.result);
       });
 
+      // 백그라운드 구글 시트 백업용 숨김 브리지
       const bridgeFrame = document.createElement('iframe');
-      bridgeFrame.title = '자산관리 시트 연결';
+      bridgeFrame.title = '자산관리 시트 백업 연결';
       bridgeFrame.setAttribute('aria-hidden', 'true');
       bridgeFrame.tabIndex = -1;
       bridgeFrame.style.cssText = 'position:fixed;left:-9999px;width:1px;height:1px;border:0;opacity:0';
@@ -138,14 +156,17 @@
       }
 
       async function writeCloud(key, data) {
-        if (!data) return;
+        if (!data) return false;
         try {
-          await fetch(`${cleanFbUrl}/asset/${key}.json`, {
+          const res = await fetch(`${cleanFbUrl}/asset/${key}.json`, {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(data)
           });
-        } catch (_) {}
+          return res.ok;
+        } catch (_) {
+          return false;
+        }
       }
 
       window.__assetSheetCall = async (action, payload) => {
@@ -153,7 +174,7 @@
         await Promise.race([
           bridgeReady,
           new Promise((_, reject) => {
-            waitTimer = setTimeout(() => reject(new Error('시트 연결이 지연되고 있어. 앱스크립트 새 버전 배포를 확인해줘.')), 15000);
+            waitTimer = setTimeout(() => reject(new Error('시트 백업 연결 대기 초과')), 15000);
           })
         ]).finally(() => clearTimeout(waitTimer));
 
@@ -161,75 +182,105 @@
           const id = 'sync-' + Date.now() + '-' + Math.random().toString(36).slice(2);
           const timer = setTimeout(() => {
             pending.delete(id);
-            reject(new Error('시트 응답 시간이 초과됐어.'));
+            reject(new Error('시트 백업 응답 시간 초과'));
           }, 25000);
           pending.set(id, { resolve, reject, timer });
           bridgeSource.postMessage({ channel: CHANNEL, id, action, payload }, '*');
         });
       };
 
+      // 핵심: 모든 읽기·쓰기는 Firebase 클라우드에서 즉시 처리하고, 구글 시트는 백그라운드 백업만 수행
       window.__assetHybridCall = async (action, payload) => {
         if (action === 'read') {
-          // Cached bootstrap paints quickly; editable state must come from Sheets.
-          const fresh = await window.__assetSheetCall('read');
-          if (!fresh || !fresh.ok) throw new Error('최신 시트 자료를 확인하지 못했어.');
-          if (fresh.state) writeCloud('state', fresh);
-          return fresh;
+          const cloudState = await readCloud('state');
+          if (cloudState && cloudState.ok) {
+            return cloudState;
+          }
+          // 클라우드가 비어 있는 최초 1회에만 시트에서 읽어와 클라우드에 저장
+          const sheetState = await window.__assetSheetCall('read');
+          if (sheetState && sheetState.ok && sheetState.state) {
+            await writeCloud('state', sheetState);
+          }
+          return sheetState;
         }
 
         if (action === 'write') {
-          const res = await window.__assetSheetCall('write', payload);
-          if (res && res.ok) {
-            const persisted = JSON.parse(JSON.stringify(payload || {}));
-            delete persisted.resetQuarters;
-            delete persisted.resetBaselines;
-            delete persisted.pendingBriefings;
-            writeCloud('state', {
-              ok: true,
-              updatedAt: res.updatedAt || Date.now(),
-              state: { ...persisted, briefings: res.briefings || [] },
-              briefings: res.briefings || []
-            });
-            // 시트 기록이 바뀌었으니 초기 스냅샷도 백그라운드 최신화
-            window.__assetSheetCall('bootstrap').then((boot) => {
-              if (boot && boot.data && boot.data.periodRows) writeCloud('bootstrap', boot);
-            }).catch(() => {});
+          const now = Date.now();
+          const prevCloud = (await readCloud('state')) || {};
+          const prevBriefings = Array.isArray(prevCloud.briefings)
+            ? prevCloud.briefings
+            : (prevCloud.state && Array.isArray(prevCloud.state.briefings) ? prevCloud.state.briefings : []);
+
+          const persisted = JSON.parse(JSON.stringify(payload || {}));
+          const pendingBriefings = Array.isArray(persisted.pendingBriefings) ? persisted.pendingBriefings : [];
+          delete persisted.resetQuarters;
+          delete persisted.resetBaselines;
+          delete persisted.pendingBriefings;
+
+          const mergedBriefings = [...pendingBriefings, ...prevBriefings];
+          const newCloudRecord = {
+            ok: true,
+            updatedAt: now,
+            state: { ...persisted, briefings: mergedBriefings },
+            briefings: mergedBriefings
+          };
+
+          // 1) Firebase 클라우드에 0.1초 만에 즉시 메인 저장
+          const saved = await writeCloud('state', newCloudRecord);
+          if (!saved) {
+            throw new Error('Firebase 클라우드 저장에 실패했어. 네트워크를 확인해줘.');
           }
-          return res;
+
+          // 2) 구글 시트(자산관리_초안)에는 백그라운드로 조용히 백업
+          window.__assetSheetCall('write', payload).then((sheetRes) => {
+            if (sheetRes && Array.isArray(sheetRes.briefings) && sheetRes.briefings.length) {
+              writeCloud('state', {
+                ok: true,
+                updatedAt: sheetRes.updatedAt || now,
+                state: { ...persisted, briefings: sheetRes.briefings },
+                briefings: sheetRes.briefings
+              });
+            }
+            window.__assetSheetCall('bootstrap').then((boot) => {
+              if (boot && boot.data && boot.data.periodRows) {
+                writeCloud('bootstrap', boot);
+                try { localStorage.setItem(BOOT_CACHE_KEY, JSON.stringify({ version: APP_BOOT_VERSION, payload: boot })); } catch (_) {}
+              }
+            }).catch(() => {});
+          }).catch((err) => {
+            console.warn('구글 시트 백그라운드 백업 건너뜀:', err);
+          });
+
+          return newCloudRecord;
         }
 
+        // 텔레그램 브리핑 전송 등 특수 작업은 앱스크립트 호출
         return window.__assetSheetCall(action, payload);
       };
 
-      // 1순위: Firebase 클라우드에서 0.1초 만에 로드 -> 없으면 구글 시트에서 직접 생성 후 클라우드 저장!
+      // 항상 Firebase 클라우드의 최신 기본 데이터를 1순위로 불러와 캐시 역전 방지
       window.__getAssetBootstrap = async () => {
+        const cloudBoot = await readCloud('bootstrap');
+        if (cloudBoot && cloudBoot.data && cloudBoot.data.periodRows) {
+          try { localStorage.setItem(BOOT_CACHE_KEY, JSON.stringify({ version: APP_BOOT_VERSION, payload: cloudBoot })); } catch (_) {}
+          return cloudBoot;
+        }
+
         try {
-          const cached = JSON.parse(localStorage.getItem('asset-bootstrap-v1') || 'null');
+          const cached = JSON.parse(localStorage.getItem(BOOT_CACHE_KEY) || 'null');
           if (cached && cached.payload && cached.payload.data && cached.payload.data.periodRows) {
-            readCloud('bootstrap').then((cloud) => {
-              if (cloud && cloud.data && cloud.data.periodRows) {
-                localStorage.setItem('asset-bootstrap-v1', JSON.stringify({ version: 'cloud-v1', payload: cloud }));
-              }
-            }).catch(() => {});
             return cached.payload;
           }
         } catch (_) {}
 
-        const cloudBoot = await readCloud('bootstrap');
-        if (cloudBoot && cloudBoot.data && cloudBoot.data.periodRows) {
-          try { localStorage.setItem('asset-bootstrap-v1', JSON.stringify({ version: 'cloud-v1', payload: cloudBoot })); } catch (_) {}
-          return cloudBoot;
-        }
-
-        // 클라우드가 비어 있으면 구글 시트 원본에서 직접 추출해 클라우드에 자동 저장
         bootStatus.textContent = '최초 1회: 구글 시트에서 기본 자산 데이터를 가져와 클라우드에 세팅 중…';
         const sheetBoot = await window.__assetSheetCall('bootstrap');
         if (sheetBoot && sheetBoot.data && sheetBoot.data.periodRows) {
           await writeCloud('bootstrap', sheetBoot);
-          try { localStorage.setItem('asset-bootstrap-v1', JSON.stringify({ version: 'cloud-v1', payload: sheetBoot })); } catch (_) {}
+          try { localStorage.setItem(BOOT_CACHE_KEY, JSON.stringify({ version: APP_BOOT_VERSION, payload: sheetBoot })); } catch (_) {}
           return sheetBoot;
         }
-        throw new Error('구글 시트 연결을 확인해줘. 앱스크립트 [새 버전 배포]가 필요해.');
+        throw new Error('Firebase 클라우드 및 시트 연결을 확인해줘.');
       };
 
       function injectIntoAssetApp(rawHtml, preloadedBootstrap) {
@@ -256,7 +307,24 @@
         const swRe = new RegExp('<script>\\(\\(\\)=>\\{if\\(!\\(\'serviceWorker\'[\\s\\S]*?<' + '/script>', 'gi');
         const cfRe = new RegExp('<script>\\(function\\(\\)\\{function c\\(\\)[\\s\\S]*?<' + '/script>', 'gi');
 
-        const bridgeReplace = "async function initializeSheetBridge(){\n  if(bridgeInitialized)return;\n  bridgeInitialized=true;\n  bridgeReady=false;\n  setSyncLabel(\"최신 시트 확인 중…\",\"pending\");\n  try {\n    const remote=await window.parent.__assetHybridCall(\"read\");\n    if(!remote || !remote.ok)throw new Error(\"최신 자료 확인 실패\");\n    const localDirty=Number(saved.localUpdatedAt||0)>Number(saved.syncUpdatedAt||0)\n      || Object.keys(pendingBriefings).length>0 || (saved.resetQuarters||[]).length>0\n      || (!saved.syncUpdatedAt && hasSavedEdits());\n    if(localDirty){\n      // Preserve local values and their unsynced timestamp. Never auto-upload on load.\n      saveLocal();\n      bridgeReady=true;\n      setSyncLabel(\"최신 시트 확인됨 · 기기 미저장 수정값 유지\",\"pending\");\n      toast(\"기기에 남은 수정값을 유지했어. 내용을 확인한 뒤 저장해줘.\");\n      return;\n    }\n    if(remote.state){\n      applySyncedState(remote.state,remote.updatedAt||Date.now());\n      briefingRows=mergeBriefingRows(briefingRows,window.BRIEFING_FALLBACK,remote.briefings);\n      refresh();\n    }\n    bridgeReady=true;\n    setSyncLabel(\"최신 시트 연결됨\",\"ready\");\n  }catch(err){\n    bridgeReady=false;\n    setSyncLabel(\"시트 확인 실패 · 기기 수정값 유지 · 새로고침 필요\",\"error\");\n  }\n}\n";
+        const bridgeReplace =
+          'async function initializeSheetBridge(){\n' +
+          '  if(bridgeInitialized)return;\n' +
+          '  bridgeInitialized=true;\n' +
+          '  bridgeReady=true;\n' +
+          '  setSyncLabel("클라우드 확인 중…","pending");\n' +
+          '  try {\n' +
+          '    const remote = await window.parent.__assetHybridCall("read");\n' +
+          '    if(remote && remote.ok && remote.state){\n' +
+          '      applySyncedState(remote.state, remote.updatedAt || Date.now());\n' +
+          '      briefingRows = mergeBriefingRows(briefingRows, window.BRIEFING_FALLBACK, remote.briefings);\n' +
+          '      refresh();\n' +
+          '    }\n' +
+          '    setSyncLabel("Firebase 클라우드 연결됨 (시트 자동백업)","ready");\n' +
+          '  } catch (err) {\n' +
+          '    setSyncLabel("저장된 자료 표시 중","pending");\n' +
+          '  }\n' +
+          '}\n';
 
         let cleaned = String(rawHtml || '')
           .replace(swRe, '')
