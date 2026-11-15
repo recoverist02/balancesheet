@@ -170,20 +170,11 @@
 
       window.__assetHybridCall = async (action, payload) => {
         if (action === 'read') {
-          const cloudState = await readCloud('state');
-          if (cloudState && cloudState.ok) {
-            window.__assetSheetCall('read').then((fresh) => {
-              if (fresh && fresh.ok && fresh.state) {
-                writeCloud('state', fresh);
-              }
-            }).catch(() => {});
-            return cloudState;
-          }
-          const sheetState = await window.__assetSheetCall('read');
-          if (sheetState && sheetState.ok && sheetState.state) {
-            writeCloud('state', sheetState);
-          }
-          return sheetState;
+          // Cached bootstrap paints quickly; editable state must come from Sheets.
+          const fresh = await window.__assetSheetCall('read');
+          if (!fresh || !fresh.ok) throw new Error('최신 시트 자료를 확인하지 못했어.');
+          if (fresh.state) writeCloud('state', fresh);
+          return fresh;
         }
 
         if (action === 'write') {
@@ -265,24 +256,7 @@
         const swRe = new RegExp('<script>\\(\\(\\)=>\\{if\\(!\\(\'serviceWorker\'[\\s\\S]*?<' + '/script>', 'gi');
         const cfRe = new RegExp('<script>\\(function\\(\\)\\{function c\\(\\)[\\s\\S]*?<' + '/script>', 'gi');
 
-        const bridgeReplace =
-          'async function initializeSheetBridge(){\n' +
-          '  if(bridgeInitialized)return;\n' +
-          '  bridgeInitialized=true;\n' +
-          '  bridgeReady=true;\n' +
-          '  setSyncLabel("클라우드 확인 중…","pending");\n' +
-          '  try {\n' +
-          '    const remote = await window.parent.__assetHybridCall("read");\n' +
-          '    if(remote && remote.ok && remote.state){\n' +
-          '      applySyncedState(remote.state, remote.updatedAt || Date.now());\n' +
-          '      briefingRows = mergeBriefingRows(briefingRows, window.BRIEFING_FALLBACK, remote.briefings);\n' +
-          '      refresh();\n' +
-          '    }\n' +
-          '    setSyncLabel("클라우드 · 시트 연결됨","ready");\n' +
-          '  } catch (err) {\n' +
-          '    setSyncLabel("저장된 자료 표시 중","pending");\n' +
-          '  }\n' +
-          '}\n';
+        const bridgeReplace = "async function initializeSheetBridge(){\n  if(bridgeInitialized)return;\n  bridgeInitialized=true;\n  bridgeReady=false;\n  setSyncLabel(\"최신 시트 확인 중…\",\"pending\");\n  try {\n    const remote=await window.parent.__assetHybridCall(\"read\");\n    if(!remote || !remote.ok)throw new Error(\"최신 자료 확인 실패\");\n    const localDirty=Number(saved.localUpdatedAt||0)>Number(saved.syncUpdatedAt||0)\n      || Object.keys(pendingBriefings).length>0 || (saved.resetQuarters||[]).length>0\n      || (!saved.syncUpdatedAt && hasSavedEdits());\n    if(localDirty){\n      // Preserve local values and their unsynced timestamp. Never auto-upload on load.\n      saveLocal();\n      bridgeReady=true;\n      setSyncLabel(\"최신 시트 확인됨 · 기기 미저장 수정값 유지\",\"pending\");\n      toast(\"기기에 남은 수정값을 유지했어. 내용을 확인한 뒤 저장해줘.\");\n      return;\n    }\n    if(remote.state){\n      applySyncedState(remote.state,remote.updatedAt||Date.now());\n      briefingRows=mergeBriefingRows(briefingRows,window.BRIEFING_FALLBACK,remote.briefings);\n      refresh();\n    }\n    bridgeReady=true;\n    setSyncLabel(\"최신 시트 연결됨\",\"ready\");\n  }catch(err){\n    bridgeReady=false;\n    setSyncLabel(\"시트 확인 실패 · 기기 수정값 유지 · 새로고침 필요\",\"error\");\n  }\n}\n";
 
         let cleaned = String(rawHtml || '')
           .replace(swRe, '')
